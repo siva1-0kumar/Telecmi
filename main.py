@@ -1,86 +1,83 @@
 # main.py
-import asyncio
-import websockets
-import json
 import os
 import base64
+import json
 import logging
+import asyncio
+import websockets
 import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()
 
-ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-VOICE_ID = os.getenv("VOICE_ID")
-PORT = int(os.getenv("PORT", 10000))
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-bridge")
 
-async def handle_connection(websocket):
-    logger.info("[TeleCMI] New WebSocket call session connected")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID")
+VOICE_ID = os.getenv("VOICE_ID")
 
-    # Connect to ElevenLabs Conversational AI
-    elevenlabs_ws = await websockets.connect(
-        f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={ELEVENLABS_AGENT_ID}",
-        extra_headers={"xi-api-key": ELEVENLABS_API_KEY},
-    )
 
-    async def from_telecmi_to_elevenlabs():
-        try:
-            async for message in websocket:
-                logger.debug("[TeleCMI] --> Audio")
-                try:
-                    data = json.loads(message)
-                    if data.get("event") == "media" and data.get("media"):
-                        audio_chunk = {
-                            "user_audio_chunk": data["media"]["payload"]
-                        }
-                        await elevenlabs_ws.send(json.dumps(audio_chunk))
-                except Exception as e:
-                    logger.error(f"Error processing TeleCMI message: {e}")
-        except Exception as e:
-            logger.warning(f"[TeleCMI] Disconnected: {e}")
+async def handle_ws(websocket):
+    logger.info("TeleCMI WebSocket connected")
 
-    async def from_elevenlabs_to_telecmi():
-        try:
-            async for msg in elevenlabs_ws:
-                logger.debug("[ElevenLabs] --> Audio")
-                try:
-                    response = json.loads(msg)
-                    if response.get("type") == "audio":
-                        audio_base64 = response["audio_event"]["audio_base_64"]
-                        await websocket.send(json.dumps({
-                            "event": "media",
-                            "media": {
-                                "payload": audio_base64
-                            }
-                        }))
-                    elif response.get("type") == "interruption":
-                        await websocket.send(json.dumps({"event": "clear"}))
-                    elif response.get("type") == "ping":
-                        await elevenlabs_ws.send(json.dumps({
-                            "type": "pong",
-                            "event_id": response["ping_event"]["event_id"]
-                        }))
-                except Exception as e:
-                    logger.error(f"Error processing ElevenLabs message: {e}")
-        except Exception as e:
-            logger.warning(f"[ElevenLabs] Disconnected: {e}")
+    # Connect to ElevenLabs WebSocket
+    elevenlabs_url = f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={ELEVENLABS_AGENT_ID}"
+    headers = {"xi-api-key": ELEVENLABS_API_KEY}
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(elevenlabs_url, headers=headers) as eleven_ws:
 
-    await asyncio.gather(
-        from_telecmi_to_elevenlabs(),
-        from_elevenlabs_to_telecmi()
-    )
+            async def forward_telecmi_to_elevenlabs():
+                async for msg in websocket:
+                    logger.debug("Message from TeleCMI: %s", msg)
+                    try:
+                        data = json.loads(msg)
+                        if data.get("event") == "media":
+                            audio_chunk = data.get("media", {}).get("payload")
+                            if audio_chunk:
+                                await eleven_ws.send_json({
+                                    "user_audio_chunk": audio_chunk
+                                })
+                        elif data.get("event") == "start":
+                            logger.info("Stream started: %s", data.get("start", {}).get("streamSid"))
+                        elif data.get("event") == "stop":
+                            logger.info("Stream stopped")
+                            await eleven_ws.close()
+                            break
+                    except Exception as e:
+                        logger.error("Error parsing TeleCMI message: %s", e)
 
-    await elevenlabs_ws.close()
-    logger.info("[Session] Closed")
+            async def forward_elevenlabs_to_telecmi():
+                async for msg in eleven_ws:
+                    if msg.type.name == "TEXT":
+                        message = json.loads(msg.data)
+                        if message.get("type") == "audio":
+                            audio_base64 = message.get("audio_event", {}).get("audio_base_64")
+                            if audio_base64:
+                                await websocket.send(json.dumps({
+                                    "event": "media",
+                                    "streamSid": "voice_sid_123",  # Replace with actual or dynamic SID
+                                    "media": {"payload": audio_base64}
+                                }))
+                        elif message.get("type") == "interruption":
+                            await websocket.send(json.dumps({
+                                "event": "clear",
+                                "streamSid": "voice_sid_123"
+                            }))
+                    elif msg.type.name == "CLOSE":
+                        break
+
+            await asyncio.gather(
+                forward_telecmi_to_elevenlabs(),
+                forward_elevenlabs_to_telecmi()
+            )
+
 
 async def main():
-    logger.info(f"Starting WebSocket server on port {PORT}...")
-    async with websockets.serve(handle_connection, "0.0.0.0", PORT, subprotocols=["telecmi"]):
+    logger.info("Starting WebSocket server on port 10000...")
+    async with websockets.serve(handle_ws, "0.0.0.0", 10000):
         await asyncio.Future()  # run forever
+
 
 if __name__ == "__main__":
     asyncio.run(main())
