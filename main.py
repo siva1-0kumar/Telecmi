@@ -1,105 +1,86 @@
-
+# main.py
 import asyncio
 import websockets
-import base64
 import json
-import requests
 import os
-from fastapi import FastAPI, WebSocket
+import base64
+import logging
+import aiohttp
 from dotenv import load_dotenv
-from starlette.responses import JSONResponse
 
 load_dotenv()
 
-TELECMI_APP_ID = os.getenv("TELECMI_APP_ID")
-TELECMI_SECRET = os.getenv("TELECMI_SECRET")
-TELECMI_PHONE = os.getenv("TELECMI_PHONE")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+VOICE_ID = os.getenv("VOICE_ID")
+PORT = int(os.getenv("PORT", 10000))
 
-app = FastAPI()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("voice-bridge")
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    print("✅ WebSocket connected from TeleCMI")
+async def handle_connection(websocket):
+    logger.info("[TeleCMI] New WebSocket call session connected")
 
-    try:
-        async with websockets.connect(
-            f"wss://api.elevenlabs.io/v1/agents/{ELEVENLABS_AGENT_ID}/stream",
-            extra_headers={"xi-api-key": ELEVENLABS_API_KEY},
-            max_size=2**24
-        ) as eleven_ws:
+    # Connect to ElevenLabs Conversational AI
+    elevenlabs_ws = await websockets.connect(
+        f"wss://api.elevenlabs.io/v1/convai/conversation?agent_id={ELEVENLABS_AGENT_ID}",
+        extra_headers={"xi-api-key": ELEVENLABS_API_KEY},
+    )
 
-            async def receive_from_telecmi():
-                while True:
-                    try:
-                        data = await websocket.receive_text()
-                        message = json.loads(data)
-                        if message.get("type") == "media":
-                            audio_base64 = message.get("media", {}).get("payload")
-                            if audio_base64:
-                                audio_bytes = base64.b64decode(audio_base64)
-                                await eleven_ws.send(audio_bytes)
-                    except Exception as e:
-                        print(f"[❌] TeleCMI receive error: {e}")
-                        break
+    async def from_telecmi_to_elevenlabs():
+        try:
+            async for message in websocket:
+                logger.debug("[TeleCMI] --> Audio")
+                try:
+                    data = json.loads(message)
+                    if data.get("event") == "media" and data.get("media"):
+                        audio_chunk = {
+                            "user_audio_chunk": data["media"]["payload"]
+                        }
+                        await elevenlabs_ws.send(json.dumps(audio_chunk))
+                except Exception as e:
+                    logger.error(f"Error processing TeleCMI message: {e}")
+        except Exception as e:
+            logger.warning(f"[TeleCMI] Disconnected: {e}")
 
-            async def receive_from_elevenlabs():
-                while True:
-                    try:
-                        data = await eleven_ws.recv()
-                        if isinstance(data, bytes):
-                            audio_base64 = base64.b64encode(data).decode("utf-8")
-                            await websocket.send_text(json.dumps({
-                                "type": "media",
-                                "media": {
-                                    "payload": audio_base64
-                                }
-                            }))
-                        else:
-                            print("[⚠️] Non-bytes message from ElevenLabs:", data)
-                    except Exception as e:
-                        print(f"[❌] ElevenLabs receive error: {e}")
-                        break
+    async def from_elevenlabs_to_telecmi():
+        try:
+            async for msg in elevenlabs_ws:
+                logger.debug("[ElevenLabs] --> Audio")
+                try:
+                    response = json.loads(msg)
+                    if response.get("type") == "audio":
+                        audio_base64 = response["audio_event"]["audio_base_64"]
+                        await websocket.send(json.dumps({
+                            "event": "media",
+                            "media": {
+                                "payload": audio_base64
+                            }
+                        }))
+                    elif response.get("type") == "interruption":
+                        await websocket.send(json.dumps({"event": "clear"}))
+                    elif response.get("type") == "ping":
+                        await elevenlabs_ws.send(json.dumps({
+                            "type": "pong",
+                            "event_id": response["ping_event"]["event_id"]
+                        }))
+                except Exception as e:
+                    logger.error(f"Error processing ElevenLabs message: {e}")
+        except Exception as e:
+            logger.warning(f"[ElevenLabs] Disconnected: {e}")
 
-            await asyncio.gather(
-                receive_from_telecmi(),
-                receive_from_elevenlabs()
-            )
+    await asyncio.gather(
+        from_telecmi_to_elevenlabs(),
+        from_elevenlabs_to_telecmi()
+    )
 
-    except Exception as e:
-        print(f"[❌] WebSocket session failed: {e}")
+    await elevenlabs_ws.close()
+    logger.info("[Session] Closed")
 
-@app.get("/trigger-call")
-def trigger_call():
-    print("⚙️ Triggering TeleCMI call...")
+async def main():
+    logger.info(f"Starting WebSocket server on port {PORT}...")
+    async with websockets.serve(handle_connection, "0.0.0.0", PORT, subprotocols=["telecmi"]):
+        await asyncio.Future()  # run forever
 
-    if not all([TELECMI_APP_ID, TELECMI_SECRET, TELECMI_PHONE]):
-        return JSONResponse(status_code=500, content={"error": "Missing TeleCMI env variables"})
-
-    url = "https://api.telecmi.com/v1/call"
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "app_id": TELECMI_APP_ID,
-        "secret": TELECMI_SECRET,
-        "from": TELECMI_PHONE,
-        "to": TELECMI_PHONE,
-        "websocket_url": "wss://telecmi.onrender.com/ws",
-        "stream_direction": "bidirectional",
-        "event_url": "https://your-callback-url.com/event",  # Optional
-        "play": [
-            {
-                "text": "Hello, this is ElevenLabs AI speaking with you over TeleCMI.",
-                "voice": "Rachel"
-            }
-        ]
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        print("📞 Call trigger response:", response.status_code, response.text)
-        return response.json()
-    except Exception as e:
-        print(f"[❌] Failed to trigger call: {e}")
-        return JSONResponse(status_code=500, content={"error": "Call trigger failed"})
+if __name__ == "__main__":
+    asyncio.run(main())
